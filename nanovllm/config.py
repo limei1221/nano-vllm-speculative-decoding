@@ -16,6 +16,9 @@ class Config:
     eos: int = -1
     kvcache_block_size: int = 256
     num_kvcache_blocks: int = -1
+    speculative_model: str | None = None
+    num_speculative_tokens: int = 0
+    num_draft_kvcache_blocks: int = -1
 
     def __post_init__(self):
         assert os.path.isdir(self.model)
@@ -23,3 +26,6 @@ class Config:
         assert 1 <= self.tensor_parallel_size <= 8
         self.hf_config = AutoConfig.from_pretrained(self.model)
         self.max_model_len = min(self.max_model_len, self.hf_config.max_position_embeddings)
+        if self.speculative_model is not None:
+            assert os.path.isdir(self.speculative_model)
+            assert self.num_speculative_tokens > 0

@@ -25,12 +25,26 @@ class Block:
 
 class BlockManager:
 
-    def __init__(self, num_blocks: int, block_size: int):
+    def __init__(self, num_blocks: int, block_size: int,
+                 num_draft_blocks: int = 0, num_speculative_tokens: int = 0):
         self.block_size = block_size
+        self.num_speculative_tokens = num_speculative_tokens
         self.blocks: list[Block] = [Block(i) for i in range(num_blocks)]
         self.hash_to_block_id: dict[int, int] = dict()
         self.free_block_ids: deque[int] = deque(range(num_blocks))
         self.used_block_ids: set[int] = set()
+
+        self.draft_blocks: list[Block] | None = None
+        self.free_draft_block_ids: deque[int] | None = None
+        self.used_draft_block_ids: set[int] | None = None
+        if num_draft_blocks > 0:
+            self.draft_blocks = [Block(i) for i in range(num_draft_blocks)]
+            self.free_draft_block_ids = deque(range(num_draft_blocks))
+            self.used_draft_block_ids = set()
+
+    @property
+    def has_draft(self) -> bool:
+        return self.draft_blocks is not None
 
     @classmethod
     def compute_hash(cls, token_ids: list[int], prefix: int = -1):
@@ -53,8 +67,28 @@ class BlockManager:
         self.used_block_ids.remove(block_id)
         self.free_block_ids.append(block_id)
 
+    def _allocate_draft_block(self, block_id: int) -> Block:
+        block = self.draft_blocks[block_id]
+        assert block.ref_count == 0
+        block.reset()
+        self.free_draft_block_ids.remove(block_id)
+        self.used_draft_block_ids.add(block_id)
+        return block
+
+    def _deallocate_draft_block(self, block_id: int):
+        assert self.draft_blocks[block_id].ref_count == 0
+        self.used_draft_block_ids.remove(block_id)
+        self.free_draft_block_ids.append(block_id)
+
+    def _blocks_needed(self, num_tokens: int) -> int:
+        return (num_tokens + self.block_size - 1) // self.block_size
+
     def can_allocate(self, seq: Sequence) -> bool:
-        return len(self.free_block_ids) >= seq.num_blocks
+        needed = seq.num_blocks
+        if not self.has_draft:
+            return len(self.free_block_ids) >= needed
+        return (len(self.free_block_ids) >= needed
+                and len(self.free_draft_block_ids) >= needed)
 
     def allocate(self, seq: Sequence):
         assert not seq.block_table
@@ -81,6 +115,12 @@ class BlockManager:
                 self.hash_to_block_id[h] = block_id
             seq.block_table.append(block_id)
 
+        if self.has_draft:
+            for _ in range(seq.num_blocks):
+                draft_id = self.free_draft_block_ids[0]
+                self._allocate_draft_block(draft_id)
+                seq.draft_block_table.append(draft_id)
+
     def deallocate(self, seq: Sequence):
         for block_id in reversed(seq.block_table):
             block = self.blocks[block_id]
@@ -90,10 +130,34 @@ class BlockManager:
         seq.num_cached_tokens = 0
         seq.block_table.clear()
 
+        if self.has_draft and seq.draft_block_table:
+            for block_id in reversed(seq.draft_block_table):
+                block = self.draft_blocks[block_id]
+                block.ref_count -= 1
+                if block.ref_count == 0:
+                    self._deallocate_draft_block(block_id)
+            seq.draft_block_table.clear()
+            seq.draft_kv_len = 0
+
     def can_append(self, seq: Sequence) -> bool:
-        return len(self.free_block_ids) >= (len(seq) % self.block_size == 1)
+        if not self.has_draft:
+            return len(self.free_block_ids) >= (len(seq) % self.block_size == 1)
+        future_len = len(seq) + self.num_speculative_tokens
+        main_needed = max(0, self._blocks_needed(future_len) - len(seq.block_table))
+        draft_needed = max(0, self._blocks_needed(future_len) - len(seq.draft_block_table))
+        return (len(self.free_block_ids) >= main_needed
+                and len(self.free_draft_block_ids) >= draft_needed)
 
     def may_append(self, seq: Sequence):
+        if not self.has_draft:
+            self._may_append_main(seq)
+        else:
+            future_len = len(seq) + self.num_speculative_tokens
+            self._ensure_blocks(seq.block_table, self.blocks, self.free_block_ids,
+                                self.used_block_ids, self.hash_to_block_id, seq, future_len)
+            self._ensure_blocks_draft(seq.draft_block_table, future_len)
+
+    def _may_append_main(self, seq: Sequence):
         block_table = seq.block_table
         last_block = self.blocks[block_table[-1]]
         if len(seq) % self.block_size == 1:
@@ -110,3 +174,31 @@ class BlockManager:
             self.hash_to_block_id[h] = last_block.block_id
         else:
             assert last_block.hash == -1
+
+    def _ensure_blocks(self, block_table, blocks, free_ids, used_ids, hash_map, seq, future_len):
+        needed = self._blocks_needed(future_len)
+        while len(block_table) < needed:
+            if block_table:
+                last = blocks[block_table[-1]]
+                if last.hash == -1:
+                    cur_tokens = len(seq) - (len(block_table) - 1) * self.block_size
+                    if cur_tokens >= self.block_size:
+                        token_ids = seq.block(len(block_table) - 1)
+                        prefix = blocks[block_table[-2]].hash if len(block_table) > 1 else -1
+                        h = self.compute_hash(token_ids, prefix)
+                        last.update(h, token_ids)
+                        hash_map[h] = last.block_id
+            block_id = free_ids[0]
+            block = blocks[block_id]
+            assert block.ref_count == 0
+            block.reset()
+            free_ids.remove(block_id)
+            used_ids.add(block_id)
+            block_table.append(block_id)
+
+    def _ensure_blocks_draft(self, draft_block_table, future_len):
+        needed = self._blocks_needed(future_len)
+        while len(draft_block_table) < needed:
+            block_id = self.free_draft_block_ids[0]
+            self._allocate_draft_block(block_id)
+            draft_block_table.append(block_id)
